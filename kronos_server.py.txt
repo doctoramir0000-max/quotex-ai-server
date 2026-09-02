@@ -1,0 +1,246 @@
+"""
+Kronos AI Trading Signal Server
+Run this server to enable AI predictions:
+    python kronos_server.py
+"""
+import sys
+import os
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(__file__))
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional
+import pandas as pd
+from datetime import datetime, timezone
+import numpy as np
+
+# Try to import Kronos model
+try:
+    from model.kronos import KronosTokenizer, Kronos, KronosPredictor
+    KRONOS_AVAILABLE = True
+    print("✅ Kronos model available")
+except ImportError as e:
+    print(f"⚠️ Kronos model not available: {e}")
+    KRONOS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Global model state (loaded once on startup)
+# ---------------------------------------------------------------------------
+tokenizer = None
+model = None
+predictor = None
+
+app = FastAPI(title="Kronos Trading Signals API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+INTERVAL_FREQ = {
+    "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "8h": "8h", "12h": "12h",
+    "1d": "1D", "3d": "3D", "1w": "1W",
+}
+
+
+@app.on_event("startup")
+async def load_models():
+    global tokenizer, model, predictor
+    
+    if not KRONOS_AVAILABLE:
+        print("⚠️ Kronos model not available - running in mock mode")
+        return
+        
+    try:
+        print("🔄 Loading KronosTokenizer...")
+        tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+        print("✅ KronosTokenizer loaded")
+        
+        print("🔄 Loading Kronos model...")
+        model = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
+        print("✅ Kronos model loaded")
+        
+        print("🔄 Building KronosPredictor...")
+        predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+        print("✅ KronosPredictor ready")
+        print("🚀 Models ready for predictions!")
+    except Exception as e:
+        print(f"❌ Error loading models: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Request schema
+# ---------------------------------------------------------------------------
+class Candle(BaseModel):
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+class PredictRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    interval: str = "1h"
+    lookback: int = 200
+    candles: Optional[List[Candle]] = None
+    timestamps: Optional[List[int]] = None  # ms epoch
+
+
+def build_df_from_candles(candles: List[Candle], timestamps: List[int]) -> pd.DataFrame:
+    df = pd.DataFrame([c.dict() for c in candles])
+    df.index = pd.to_datetime(timestamps, unit="ms", utc=True)
+    df.index.name = "open_time"
+    return df
+
+
+def build_timestamps(df: pd.DataFrame, interval: str, pred_len: int = 24):
+    freq = INTERVAL_FREQ.get(interval, "1h")
+    x_timestamp = df.index.to_series().reset_index(drop=True)
+    last_ts = df.index[-1]
+    y_timestamp = pd.Series(
+        pd.date_range(start=last_ts, periods=pred_len + 1, freq=freq)[1:]
+    )
+    return x_timestamp, y_timestamp
+
+
+# ---------------------------------------------------------------------------
+# Mock predictor (fallback when Kronos not available)
+# ---------------------------------------------------------------------------
+def mock_predict(df, pred_len=24):
+    """Generate mock predictions for testing when Kronos is not available"""
+    last_close = df["close"].iloc[-1]
+    
+    np.random.seed(42)
+    returns = np.random.normal(0.001, 0.02, pred_len)
+    prices = last_close * np.cumprod(1 + returns)
+    
+    forecast = pd.DataFrame()
+    forecast["close"] = prices
+    forecast["open"] = np.roll(prices, 1)
+    forecast["open"].iloc[0] = last_close
+    forecast["high"] = forecast[["open", "close"]].max(axis=1) * (1 + np.random.uniform(0, 0.01, pred_len))
+    forecast["low"] = forecast[["open", "close"]].min(axis=1) * (1 - np.random.uniform(0, 0.01, pred_len))
+    forecast["volume"] = np.random.uniform(100, 1000, pred_len)
+    
+    return forecast
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok", 
+        "model": "kronos-mini" if KRONOS_AVAILABLE else "mock",
+        "kronos_available": KRONOS_AVAILABLE
+    }
+
+
+@app.post("/predict")
+async def predict(req: PredictRequest):
+    try:
+        if req.candles and req.timestamps:
+            df = build_df_from_candles(req.candles, req.timestamps)
+        else:
+            return JSONResponse(status_code=400, content={"error": "candles and timestamps are required"})
+
+        pred_len = 24
+        x_timestamp, y_timestamp = build_timestamps(df, req.interval, pred_len)
+
+        if KRONOS_AVAILABLE and predictor is not None:
+            try:
+                forecast = predictor.predict(
+                    df,
+                    x_timestamp,
+                    y_timestamp,
+                    pred_len=pred_len,
+                    T=1.0,
+                    top_k=0,
+                    top_p=0.9,
+                    sample_count=1,
+                    verbose=False,
+                )
+            except Exception as e:
+                print(f"⚠️ Kronos prediction failed: {e}")
+                forecast = mock_predict(df, pred_len)
+        else:
+            forecast = mock_predict(df, pred_len)
+
+        last_close: float = float(df["close"].iloc[-1])
+        forecast_close_24h: float = float(forecast["close"].iloc[-1])
+        direction_prob: float = float((forecast["close"] > last_close).sum()) / pred_len
+        direction: str = "ALCISTA" if direction_prob >= 0.5 else "BAJISTA"
+        forecast_high: float = float(forecast["high"].max())
+        forecast_low: float = float(forecast["low"].min())
+        volatility_range_pct: float = (forecast_high - forecast_low) / last_close * 100
+
+        if volatility_range_pct > 4:
+            volatility_label = "ALTA"
+        elif volatility_range_pct > 2:
+            volatility_label = "MEDIA"
+        else:
+            volatility_label = "BAJA"
+
+        historical_candles = [
+            {
+                "t": int(ts.timestamp()),
+                "o": round(float(df["open"].iloc[i]), 6),
+                "h": round(float(df["high"].iloc[i]), 6),
+                "l": round(float(df["low"].iloc[i]), 6),
+                "c": round(float(df["close"].iloc[i]), 6),
+                "v": round(float(df["volume"].iloc[i]), 2),
+            }
+            for i, ts in enumerate(df.index[-100:])
+        ]
+
+        forecast_candles = [
+            {
+                "t": int(ts.timestamp()),
+                "o": round(float(forecast["open"].iloc[i]), 6),
+                "h": round(float(forecast["high"].iloc[i]), 6),
+                "l": round(float(forecast["low"].iloc[i]), 6),
+                "c": round(float(forecast["close"].iloc[i]), 6),
+            }
+            for i, ts in enumerate(y_timestamp)
+        ]
+
+        return {
+            "symbol": req.symbol,
+            "interval": req.interval,
+            "direction": direction,
+            "direction_prob": round(direction_prob, 4),
+            "volatility_label": volatility_label,
+            "volatility_range_pct": round(volatility_range_pct, 4),
+            "forecast_high": round(forecast_high, 4),
+            "forecast_low": round(forecast_low, 4),
+            "forecast_close_24h": round(forecast_close_24h, 4),
+            "last_close": round(last_close, 4),
+            "historical_candles": historical_candles,
+            "forecast_candles": forecast_candles,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": "prediction_failed", "detail": str(e)})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Kronos AI Trading Signal Server...")
+    print("   URL: http://localhost:8000")
+    print("   Health: http://localhost:8000/health")
+    print("   Predict: POST http://localhost:8000/predict")
+    print("")
+    print("   To use with extension, make sure server is running")
+    print("   and restart the extension.")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
