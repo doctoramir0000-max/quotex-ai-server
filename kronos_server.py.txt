@@ -1,7 +1,5 @@
 """
 Kronos AI Trading Signal Server
-Run this server to enable AI predictions:
-    python kronos_server.py
 """
 import sys
 import os
@@ -28,7 +26,7 @@ except ImportError as e:
     KRONOS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Global model state (loaded once on startup)
+# Global model state
 # ---------------------------------------------------------------------------
 tokenizer = None
 model = None
@@ -90,7 +88,7 @@ class PredictRequest(BaseModel):
     interval: str = "1h"
     lookback: int = 200
     candles: Optional[List[Candle]] = None
-    timestamps: Optional[List[int]] = None  # ms epoch
+    timestamps: Optional[List[int]] = None
 
 
 def build_df_from_candles(candles: List[Candle], timestamps: List[int]) -> pd.DataFrame:
@@ -111,10 +109,10 @@ def build_timestamps(df: pd.DataFrame, interval: str, pred_len: int = 24):
 
 
 # ---------------------------------------------------------------------------
-# Mock predictor (fallback when Kronos not available)
+# Mock predictor
 # ---------------------------------------------------------------------------
 def mock_predict(df, pred_len=24):
-    """Generate mock predictions for testing when Kronos is not available"""
+    """Generate mock predictions"""
     last_close = df["close"].iloc[-1]
     
     np.random.seed(42)
@@ -234,13 +232,5 @@ async def predict(req: PredictRequest):
         return JSONResponse(status_code=500, content={"error": "prediction_failed", "detail": str(e)})
 
 
-if __name__ == "__main__":
-    import uvicorn
-    print("🚀 Starting Kronos AI Trading Signal Server...")
-    print("   URL: http://localhost:8000")
-    print("   Health: http://localhost:8000/health")
-    print("   Predict: POST http://localhost:8000/predict")
-    print("")
-    print("   To use with extension, make sure server is running")
-    print("   and restart the extension.")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# This is needed for Render
+app = app
